@@ -1,0 +1,31 @@
+{
+  "kind": "collectionType",
+  "collectionName": "plans",
+  "info": {
+    "singularName": "plan",
+    "pluralName": "plans",
+    "displayName": "plan"
+  },
+  "options": {
+    "draftAndPublish": true
+  },
+  "pluginOptions": {},
+  "attributes": {
+    "title": {
+      "type": "string",
+      "required": true
+    },
+    "description": {
+      "type": "string",
+      "required": true
+    },
+    "price": {
+      "type": "string",
+      "required": true
+    },
+    "about": {
+      "type": "string",
+      "required": true
+    }
+  }
+}

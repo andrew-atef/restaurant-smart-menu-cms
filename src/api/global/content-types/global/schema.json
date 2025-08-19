@@ -20,16 +20,60 @@
       "type": "media",
       "multiple": false,
       "required": false,
-      "allowedTypes": ["images", "files", "videos"]
+      "allowedTypes": [
+        "images",
+        "files",
+        "videos"
+      ]
     },
-    "siteDescription": {
+    "slogan": {
       "type": "text",
       "required": true
     },
     "defaultSeo": {
       "type": "component",
-      "repeatable": false,
-      "component": "shared.seo"
+      "component": "shared.seo",
+      "repeatable": false
+    },
+    "image": {
+      "type": "media",
+      "multiple": false,
+      "required": true,
+      "allowedTypes": [
+        "images"
+      ]
+    },
+    "email": {
+      "type": "email",
+      "required": true
+    },
+    "phone": {
+      "type": "string",
+      "required": true
+    },
+    "address": {
+      "type": "text",
+      "required": true
+    },
+    "working_hours": {
+      "type": "text",
+      "required": true
+    },
+    "facebook_url": {
+      "type": "text",
+      "required": false
+    },
+    "instagram_url": {
+      "type": "text"
+    },
+    "twitter_url": {
+      "type": "text"
+    },
+    "linkedin_url": {
+      "type": "text"
+    },
+    "github_url": {
+      "type": "text"
     }
   }
 }
