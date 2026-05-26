@@ -1,9 +1,5 @@
 #!/usr/bin/env python3
-import os
-import sys
-import time
-import logging
-import requests
+import logging, os, sys, time
 import oci
 from oci.core import ComputeClient
 from oci.core.models import (
@@ -13,163 +9,121 @@ from oci.core.models import (
     CreateVnicDetails,
 )
 
-# إعدادات التسجيل ومستويات التنبيه
 logging.basicConfig(
     level=logging.INFO,
     format="%(asctime)s [Sniper] %(message)s",
     datefmt="%H:%M:%S",
-    stream=sys.stdout
+    stream=sys.stdout,
 )
 log = logging.getLogger("sniper")
 
-SHAPE = "VM.Standard.A1.Flex"
-POLL_SEC = 60
+SHAPE          = "VM.Standard.A1.Flex"
+OCPUS          = 4
+MEMORY_GB      = 24
+BOOT_GB        = 150
+POLL_SEC       = 30
 
-def resolve_boot_image(compute, compartment_id):
-    """البحث عن صورة نظام التشغيل Oracle Linux المتوافقة مع بنية ARM"""
-    try:
-        images = compute.list_images(compartment_id, shape=SHAPE).data
-        for ver in ("9", "8"):
-            for img in images:
-                if img.operating_system == "Oracle Linux" and (img.operating_system_version or "").startswith(ver):
-                    log.info("Boot image found: %s", img.display_name)
-                    return img.id
-        for img in images:
-            if img.operating_system == "Oracle Linux":
-                log.info("Boot image found: %s", img.display_name)
-                return img.id
-    except Exception as e:
-        log.error("Failed to query OCI images: %s", e)
-    raise RuntimeError("No Oracle Linux image found for shape %s" % SHAPE)
+COMPARTMENT_ID = "ocid1.tenancy.oc1..aaaaaaaafrnizf6albjspf5375mjjxndcqewxs3olbkuy3gxcf63lweiivaq"
+SUBNET_ID      = "ocid1.subnet.oc1.uk-london-1.aaaaaaaaqnqxz6ben7xqcfyzkccfie75euv5p3vka7jsfx4dre6kxi4ue22q"
+IMAGE_ID       = "ocid1.image.oc1.uk-london-1.aaaaaaaajrz3jystpmnr3olyl354fhrotkiuvzempttpcp2yr2quizabm5wa"
+ADS            = [
+    "gugN:UK-LONDON-1-AD-1",
+    "gugN:UK-LONDON-1-AD-2",
+    "gugN:UK-LONDON-1-AD-3",
+]
 
-def send_notification(url, message):
-    """إرسال تنبيه نجاح إلى Webhook الخارجي"""
-    if not url:
-        return
-    try:
-        requests.post(url, json={"text": message}, timeout=10)
-        log.info("Notification sent successfully.")
-    except Exception as e:
-        log.error("Failed to send notification webhook: %s", e)
+SSH_KEY = os.environ.get("SSH_PUBLIC_KEY", "")
+
+RETRYABLE_HTTP  = {429, 500, 503, 404}
+RETRYABLE_CODES = {
+    "outofhostcapacity",
+    "internalerror",
+    "internalerrortryagainlater",
+    "limitexceeded",
+    "notauthorizedornotfound",
+    "requestlimitexceeded",
+}
+
+def is_retryable(exc):
+    if isinstance(exc, oci.exceptions.ServiceError):
+        code = (exc.code or "").lower().replace("-", "").replace("_", "")
+        msg  = (exc.message or "").lower()
+        return (
+            exc.status in RETRYABLE_HTTP
+            or any(k in code for k in RETRYABLE_CODES)
+            or "capacity" in msg
+        )
+    return True
+
+def error_label(exc):
+    if isinstance(exc, oci.exceptions.ServiceError):
+        return f"{exc.status} {exc.code}"
+    return type(exc).__name__
 
 def main():
-    compartment_id = os.environ.get("OCI_COMPARTMENT_OCID")
-    subnet_id = os.environ.get("OCI_SUBNET_OCID")
-    ssh_key = os.environ.get("SSH_PUBLIC_KEY")
-
-    # التحقق من وجود المتغيرات البيئية المطلوبة
-    for val, name in [(compartment_id, "OCI_COMPARTMENT_OCID"), (subnet_id, "OCI_SUBNET_OCID"), (ssh_key, "SSH_PUBLIC_KEY")]:
-        if not val:
-            log.critical("Missing required environment variable: %s", name)
-            sys.exit(1)
-
-    ocpus = int(os.environ.get("OCPUS", "2"))
-    memory_gb = int(os.environ.get("MEMORY_GB", "12"))
-    boot_volume_gb = int(os.environ.get("BOOT_VOLUME_GB", "150"))
-    webhook_url = os.environ.get("SUCCESS_WEBHOOK_URL")
-
-    # تحميل ملف الإعدادات الخاص بالـ API
-    try:
-        config = oci.config.from_file()
-        config["connection_timeout"] = 30
-        config["read_timeout"] = 60
-    except Exception as e:
-        log.critical("Failed to load OCI config from default path (~/.oci/config): %s", e)
+    if not SSH_KEY:
+        log.critical("SSH_PUBLIC_KEY missing")
         sys.exit(1)
 
-    # إنشاء كائنات الاتصال بالـ OCI
-    compute_client = ComputeClient(config)
-    identity_client = oci.identity.IdentityClient(config)
+    config = oci.config.from_file()
+    config["timeout"] = (10, 15)
+    compute = ComputeClient(config)
 
-    # جلب نطاقات الإتاحة (Availability Domains)
-    try:
-        ads = [ad.name for ad in identity_client.list_availability_domains(compartment_id).data]
-        log.info("Availability Domains: %s", ", ".join(ads))
-    except Exception as e:
-        log.critical("Failed to list Availability Domains. Verify your OCI Config and Tenancy: %s", e)
-        sys.exit(1)
-
-    # جلب صورة نظام التشغيل
-    try:
-        image_id = resolve_boot_image(compute_client, compartment_id)
-    except Exception as e:
-        log.critical(e)
-        sys.exit(1)
-
-    log.info("=======================================================")
-    log.info("  ARM Sniper initialized successfully.")
-    log.info("  Shape: %s | OCPUs: %d | Memory: %dGB | Boot Volume: %dGB", SHAPE, ocpus, memory_gb, boot_volume_gb)
-    log.info("  Polling Interval: %ds | Target ADs: %d", POLL_SEC, len(ads))
-    log.info("=======================================================")
+    log.info("OCI ready — region: %s", config.get("region", "?"))
+    log.info("ADs: %s", ", ".join(ADS))
+    log.info("=" * 55)
+    log.info("  ARM Sniper — %s  CPU:%d  RAM:%dG  Boot:%dG", SHAPE, OCPUS, MEMORY_GB, BOOT_GB)
+    log.info("  Poll: %ds", POLL_SEC)
+    log.info("=" * 55)
 
     attempt = 0
+    ad_idx  = 0
+
     while True:
-        for ad in ads:
-            attempt += 1
-            log.info("Attempt #%d: Requesting instance creation in %s...", attempt, ad)
+        attempt += 1
+        ad = ADS[ad_idx % len(ADS)]
+        ad_idx += 1
 
-            # تجهيز هياكل البيانات لطلب الإنشاء
-            shape_config = LaunchInstanceShapeConfigDetails(
-                ocpus=ocpus,
-                memory_in_gbs=memory_gb
-            )
-            source_details = InstanceSourceViaImageDetails(
-                source_type="image",
-                image_id=image_id,
-                boot_volume_size_in_gbs=boot_volume_gb
-            )
-            vnic_details = CreateVnicDetails(
-                subnet_id=subnet_id,
-                assign_public_ip=True
-            )
-            launch_details = LaunchInstanceDetails(
-                compartment_id=compartment_id,
-                availability_domain=ad,
-                shape=SHAPE,
-                shape_config=shape_config,
-                source_details=source_details,
-                create_vnic_details=vnic_details,
-                display_name="AlwaysFree-ARM-Instance",
-                metadata={"ssh_authorized_keys": ssh_key}
-            )
+        details = LaunchInstanceDetails(
+            availability_domain = ad,
+            compartment_id      = COMPARTMENT_ID,
+            display_name        = "arm-sniper",
+            image_id            = IMAGE_ID,
+            shape               = SHAPE,
+            shape_config        = LaunchInstanceShapeConfigDetails(
+                ocpus         = OCPUS,
+                memory_in_gbs = MEMORY_GB,
+            ),
+            source_details      = InstanceSourceViaImageDetails(
+                image_id                = IMAGE_ID,
+                boot_volume_size_in_gbs = BOOT_GB,
+            ),
+            create_vnic_details = CreateVnicDetails(
+                subnet_id        = SUBNET_ID,
+                assign_public_ip = True,
+            ),
+            metadata = {"ssh_authorized_keys": SSH_KEY},
+        )
 
-            try:
-                # إرسال طلب الإنشاء الفعلي للـ API
-                response = compute_client.launch_instance(launch_details)
-                success_msg = f"SUCCESS! Instance created successfully. Instance ID: {response.data.id}"
-                log.info(success_msg)
-                send_notification(webhook_url, success_msg)
-                sys.exit(0)
-
-            except oci.exceptions.ServiceError as exc:
-                err_msg = (exc.message or "").lower()
-                err_code = (exc.code or "").lower()
-
-                # تحديد ما إذا كان الخطأ ناتج عن عدم وجود سعة كافية في الخوادم
-                is_capacity_issue = (
-                    "capacity" in err_msg or
-                    "limit" in err_msg or
-                    "outofcapacity" in err_code or
-                    "limitexceeded" in err_code or
-                    exc.status in (429, 500, 503)
-                )
-
-                if is_capacity_issue:
-                    log.info("AD %s: Out of capacity (Status: %d). Retrying in %ds...", ad, exc.status, POLL_SEC)
-                elif exc.status == 404:
-                    log.error("Fatal 404 Error: Authorization failed or Subnet/Compartment OCID is incorrect.")
-                    log.error("Please verify that OCI_COMPARTMENT_OCID and OCI_SUBNET_OCID in your environment match your OCI console exactly.")
-                    log.error("Details: %s", exc.message)
-                    sys.exit(1)
-                else:
-                    log.error("Unexpected OCI Service Error (Status: %d, Code: %s): %s", exc.status, exc.code, exc.message)
-                    log.info("Retrying in %ds...", POLL_SEC)
-
-            except Exception as e:
-                log.error("Unexpected connection or system error: %s", e)
-                log.info("Retrying in %ds...", POLL_SEC)
-
-            time.sleep(POLL_SEC)
+        try:
+            resp = compute.launch_instance(details)
+            inst = resp.data
+            log.info("=" * 55)
+            log.info("  SUCCESS!")
+            log.info("  Name  : %s", inst.display_name)
+            log.info("  OCID  : %s", inst.id)
+            log.info("  AD    : %s", ad)
+            log.info("  State : %s", inst.lifecycle_state)
+            log.info("=" * 55)
+            sys.exit(0)
+        except Exception as exc:
+            label = error_label(exc)
+            if is_retryable(exc):
+                log.info("Attempt #%d: %s in %s — retry in %ds", attempt, label, ad, POLL_SEC)
+                time.sleep(POLL_SEC)
+            else:
+                log.error("Fatal: %s", exc)
+                sys.exit(1)
 
 if __name__ == "__main__":
     main()
